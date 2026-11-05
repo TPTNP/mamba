@@ -259,11 +259,17 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
             dD = tl.sum(dout_res * x)
             if DETERMINISTIC_REDUCTION:
                 tl.store(dD_ptr + pid_n * stride_dD_hdim, dD)
+            elif num_pid_n == 1:
+                # A head's channels in one tile: this program is the only writer.
+                tl.store(dD_ptr, dD)
             else:
                 tl.atomic_add(dD_ptr, dD)
     ddt = tl.sum(acc * x, axis=1)
     ddt_ptrs = ddt_ptr + offs_m * stride_ddt_csize
-    if DETERMINISTIC_REDUCTION:
+    # The programs of a head's column tiles each add their share of ddt.  With the head's channels
+    # in one tile, as at headdim 32 with any of the configurations above, each position has one
+    # writer, and a store is the add onto the zeroed buffer without the atomic.
+    if DETERMINISTIC_REDUCTION or num_pid_n == 1:
         tl.store(ddt_ptrs, ddt, mask=offs_m < chunk_size)
     else:
         tl.atomic_add(ddt_ptrs, ddt, mask=offs_m < chunk_size)
@@ -413,7 +419,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # dA_cumsum_tmp2, dt_tmp2 = _chunk_cumsum_fwd(dt[:, 147:256], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
     if not return_final_states and cu_seqlens is None and _single_chunk(seqlen, chunk_size, initial_states, seq_idx):
-        CB = _bmm_chunk_fwd(C, B, chunk_size, output_dtype=torch.float32)
+        CB = _bmm_chunk_fwd(C, B, chunk_size, causal=True, output_dtype=torch.float32)
         out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, None, D=D, z=z)
         return out, out_x, dt, dA_cumsum, None, None
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
@@ -427,7 +433,9 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
     # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
-    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    # Causal: only CB[i, j] for j <= i is computed -- the tiles wholly above the diagonal are left
+    # unwritten -- since the scan's kernels read the rest only to mask it away with a where.
+    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, causal=True, output_dtype=torch.float32)
     out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
@@ -484,7 +492,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     dt_in = dt.clone()
     dA_cumsum, dt = _chunk_cumsum_fwd(dt_in, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus,
                                       dt_limit=dt_limit)
-    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, causal=True, output_dtype=torch.float32)
     if dfinal_states is None and _single_chunk(seqlen, chunk_size, initial_states, seq_idx):
         # Nothing flows back through a state: no recomputed states, no state passing either way,
         # and none of what B, C and the decay receive through them.

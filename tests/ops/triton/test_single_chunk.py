@@ -28,6 +28,39 @@ def _accelerator():
 
 
 ATOMIC = ("dt_bias", "A_log", "D", "conv1d.weight", "conv1d.bias")
+
+
+def pin_configurations(test):
+    """Every autotuned scan kernel at its smallest configuration, for the rest of ``test``.
+
+    The kernels with and without states are tuned separately (HAS_STATES is a tuning key), and a
+    different tile sums dD's partial sums in another order; at one configuration each, the two
+    paths must agree to the bit.
+    """
+    import sys
+    from triton.runtime.autotuner import Autotuner
+
+    def size(config):
+        product = 1
+        for value in config.kwargs.values():
+            product *= value if isinstance(value, int) else 1
+        return (product, config.num_warps)
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("mamba_ssm.ops.triton") or module is None:
+            continue
+        for value in list(vars(module).values()):
+            for _ in range(4):
+                if isinstance(value, Autotuner):
+                    patcher = patch.object(value, "configs", [min(value.configs, key=size)])
+                    patcher.start()
+                    test.addCleanup(patcher.stop)
+                    kept = dict(value.cache)
+                    value.cache.clear()
+                    test.addCleanup(lambda tuner=value, kept=kept: (tuner.cache.clear(), tuner.cache.update(kept)))
+                    break
+                value = getattr(value, "fn", None)
+                if value is None:
+                    break
 # causal_conv1d's backward sums the weight and bias gradients with atomic adds whatever the mode.
 CONVOLUTION = ("conv1d.weight", "conv1d.bias")
 
@@ -48,6 +81,7 @@ class TheChoice(unittest.TestCase):
 class AgainstTheFullScan(unittest.TestCase):
     def setUp(self):
         self.device = _accelerator()
+        pin_configurations(self)
         self.states_computed = 0
         original = ssd_combined._chunk_state_fwd
 
