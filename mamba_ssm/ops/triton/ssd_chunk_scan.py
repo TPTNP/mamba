@@ -45,7 +45,7 @@ def init_to_zero(names):
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=2),
     ]),
-    key=['chunk_size', 'hdim', 'dstate', 'IS_CAUSAL'],
+    key=['chunk_size', 'hdim', 'dstate', 'IS_CAUSAL', 'HAS_STATES'],
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
@@ -74,6 +74,9 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
+    # Whether each chunk reads a state it starts from.  A sequence of one chunk with no initial
+    # state starts from zeros, and the whole term C @ prev_states is left out.
+    HAS_STATES: tl.constexpr = True,
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -104,30 +107,31 @@ def _chunk_scan_fwd_kernel(
     # Without the if (pid_c > -1), with Triton 2.1.0, I get
     # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
     # With Triton 2.2.0, this works
-    if IS_TRITON_22 or pid_c > -1:
-        # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
-        offs_k_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
-        C_ptrs = C_ptr + (offs_m[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate)
-        prev_states_ptrs = prev_states_ptr + (offs_n[None, :] * stride_states_hdim + offs_k_dstate[:, None] * stride_states_dstate)
-        if not HAS_SEQ_IDX:
-            scale_m = tl.exp(dA_cs_m)
-        else:
-            scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
-        if BLOCK_SIZE_DSTATE <= 128:
-            C = tl.load(C_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
-            prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
-            prev_states = prev_states.to(C_ptr.dtype.element_ty)
-            acc = tl.dot(C, prev_states) * scale_m[:, None]
-        else:
-            for k in range(0, dstate, BLOCK_SIZE_K):
-                C = tl.load(C_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
-                # C = (C * scale_m[:, None]).to(C_ptr.dtype.element_ty)
-                prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
+    if HAS_STATES:
+        if IS_TRITON_22 or pid_c > -1:
+            # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
+            offs_k_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
+            C_ptrs = C_ptr + (offs_m[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate)
+            prev_states_ptrs = prev_states_ptr + (offs_n[None, :] * stride_states_hdim + offs_k_dstate[:, None] * stride_states_dstate)
+            if not HAS_SEQ_IDX:
+                scale_m = tl.exp(dA_cs_m)
+            else:
+                scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
+            if BLOCK_SIZE_DSTATE <= 128:
+                C = tl.load(C_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
+                prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                acc += tl.dot(C, prev_states)
-                C_ptrs += BLOCK_SIZE_K
-                prev_states_ptrs += BLOCK_SIZE_K
-            acc *= scale_m[:, None]
+                acc = tl.dot(C, prev_states) * scale_m[:, None]
+            else:
+                for k in range(0, dstate, BLOCK_SIZE_K):
+                    C = tl.load(C_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
+                    # C = (C * scale_m[:, None]).to(C_ptr.dtype.element_ty)
+                    prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
+                    prev_states = prev_states.to(C_ptr.dtype.element_ty)
+                    acc += tl.dot(C, prev_states)
+                    C_ptrs += BLOCK_SIZE_K
+                    prev_states_ptrs += BLOCK_SIZE_K
+                acc *= scale_m[:, None]
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     cb_ptrs = cb_ptr + (offs_m[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
@@ -1259,6 +1263,7 @@ def _chunk_scan_bwd_ddAcs_prev_kernel(
 
 
 def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=None):
+    """``states`` None: one chunk per sequence and no initial state, so no chunk reads a state."""
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -1271,7 +1276,10 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
-    assert states.shape == (batch, nchunks, nheads, headdim, dstate)
+    if states is not None:
+        assert states.shape == (batch, nchunks, nheads, headdim, dstate)
+    else:
+        assert nchunks == 1, "without states every sequence must fit in one chunk"
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
     # Allocates output.
@@ -1286,7 +1294,7 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                   if z is not None else (0, 0, 0, 0))
     _chunk_scan_fwd_kernel[grid](
-        cb, x, z, out, out_x, dt, dA_cumsum, seq_idx, C, states, D,
+        cb, x, z, out, out_x, dt, dA_cumsum, seq_idx, C, states if states is not None else x, D,
         chunk_size, headdim, dstate,
         batch, seqlen, nheads // ngroups,
         cb.stride(0), cb.stride(1), cb.stride(2), cb.stride(3), cb.stride(4),
@@ -1297,7 +1305,7 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
         *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
         C.stride(0), C.stride(1), C.stride(2), C.stride(3),
-        states.stride(0), states.stride(1), states.stride(2), states.stride(3), states.stride(4),
+        *(states.stride() if states is not None else (0, 0, 0, 0, 0)),
         D.stride(0) if D is not None else 0,
         True,
         D is not None,
@@ -1306,6 +1314,7 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         HAS_Z=z is not None,
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
+        HAS_STATES=states is not None,
     )
     return out, out_x
 
