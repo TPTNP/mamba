@@ -16,6 +16,8 @@ from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 import triton
 import triton.language as tl
 
+from mamba_ssm.utils.device import device_context, norm_backward_programs
+
 from mamba_ssm.utils.determinism import autotune_configs
 
 
@@ -367,7 +369,7 @@ def _layer_norm_fwd(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    with torch.cuda.device(x.device.index):
+    with device_context(x.device):
         _layer_norm_fwd_1pass_kernel[(M,)](
             x,
             y,
@@ -657,7 +659,7 @@ def _layer_norm_bwd(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+    sm_count = norm_backward_programs(x.device)
     _dw = torch.empty((sm_count, N), dtype=torch.float32, device=weight.device)
     _db = (
         torch.empty((sm_count, N), dtype=torch.float32, device=bias.device)
@@ -668,7 +670,7 @@ def _layer_norm_bwd(
     _db1 = torch.empty_like(_db) if bias1 is not None else None
     rows_per_program = math.ceil(M / sm_count)
     grid = (sm_count,)
-    with torch.cuda.device(x.device.index):
+    with device_context(x.device):
         _layer_norm_bwd_kernel[grid](
             x,
             weight,
