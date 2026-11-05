@@ -6,6 +6,7 @@
 from typing import Optional
 
 import math
+import os
 from packaging import version
 
 import torch
@@ -97,7 +98,7 @@ def ensure_stride(inp):
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
     ]),
-    key=['chunk_size', 'hdim', 'dstate'],
+    key=['chunk_size', 'hdim', 'dstate', 'HAS_STATES'],
 )
 @triton.jit
 def _chunk_scan_chunk_state_bwd_dx_kernel(
@@ -129,6 +130,9 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
+    # Whether a gradient flows back through the states.  With one chunk per sequence, no initial
+    # state and no gradient of the final one, none does, and the term B @ dstates is left out.
+    HAS_STATES: tl.constexpr = True,
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -157,36 +161,37 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
 
     dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize, mask=offs_m < chunk_size_limit, other=0.0).to(tl.float32)
 
-    dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
-    if not HAS_SEQ_IDX:
-        # scale = tl.exp(dA_cs_last - dA_cs_m)
-        scale = tl.exp(tl.minimum((dA_cs_last - dA_cs_m), 0.0))
-    else:
-        seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
-        seq_idx_last = tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
-        # scale = tl.where(seq_idx_m == seq_idx_last, tl.exp(dA_cs_last - dA_cs_m), 0.0)
-        scale = tl.where(seq_idx_m == seq_idx_last, tl.exp(tl.minimum((dA_cs_last - dA_cs_m), 0.0)), 0.0)
-    # Might be faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
-    # However, we're getting error with the Triton compiler 2.1.0 for that code path:
-    # Unexpected mma -> mma layout conversion
-    # Triton 2.2.0 fixes this
-    offs_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
-    b_ptrs = b_ptr + (offs_m[:, None] * stride_b_seqlen + offs_dstate[None, :] * stride_b_dstate)
-    dstates_ptrs = dstates_ptr + (offs_n[None, :] * stride_dstates_hdim + offs_dstate[:, None] * stride_dstates_dstate)
-    if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128:
-        b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate), other=0.0)
-        dstates = tl.load(dstates_ptrs, mask=(offs_dstate[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
-        dstates = dstates.to(b_ptr.dtype.element_ty)
-        acc = tl.dot(b, dstates) * scale[:, None]
-    else:
-        for k in range(0, dstate, BLOCK_SIZE_K):
-            b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate - k), other=0.0)
-            dstates = tl.load(dstates_ptrs, mask=(offs_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
+    if HAS_STATES:
+        dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
+        if not HAS_SEQ_IDX:
+            # scale = tl.exp(dA_cs_last - dA_cs_m)
+            scale = tl.exp(tl.minimum((dA_cs_last - dA_cs_m), 0.0))
+        else:
+            seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
+            seq_idx_last = tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
+            # scale = tl.where(seq_idx_m == seq_idx_last, tl.exp(dA_cs_last - dA_cs_m), 0.0)
+            scale = tl.where(seq_idx_m == seq_idx_last, tl.exp(tl.minimum((dA_cs_last - dA_cs_m), 0.0)), 0.0)
+        # Might be faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
+        # However, we're getting error with the Triton compiler 2.1.0 for that code path:
+        # Unexpected mma -> mma layout conversion
+        # Triton 2.2.0 fixes this
+        offs_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
+        b_ptrs = b_ptr + (offs_m[:, None] * stride_b_seqlen + offs_dstate[None, :] * stride_b_dstate)
+        dstates_ptrs = dstates_ptr + (offs_n[None, :] * stride_dstates_hdim + offs_dstate[:, None] * stride_dstates_dstate)
+        if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128:
+            b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate), other=0.0)
+            dstates = tl.load(dstates_ptrs, mask=(offs_dstate[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
             dstates = dstates.to(b_ptr.dtype.element_ty)
-            acc += tl.dot(b, dstates)
-            b_ptrs += BLOCK_SIZE_K * stride_b_dstate
-            dstates_ptrs += BLOCK_SIZE_K * stride_dstates_dstate
-        acc *= scale[:, None]
+            acc = tl.dot(b, dstates) * scale[:, None]
+        else:
+            for k in range(0, dstate, BLOCK_SIZE_K):
+                b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate - k), other=0.0)
+                dstates = tl.load(dstates_ptrs, mask=(offs_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
+                dstates = dstates.to(b_ptr.dtype.element_ty)
+                acc += tl.dot(b, dstates)
+                b_ptrs += BLOCK_SIZE_K * stride_b_dstate
+                dstates_ptrs += BLOCK_SIZE_K * stride_dstates_dstate
+            acc *= scale[:, None]
 
     # x_ptrs = x_ptr + (offs_m[:, None] * stride_x_seqlen + offs_n[None, :] * stride_x_hdim)
     # x = tl.load(x_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
@@ -270,6 +275,8 @@ _CHUNK_SCAN_CHUNK_STATE_BWD_DX_MIN_BLOCK_N = min(
 
 
 def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=None, seq_idx=None, dx=None):
+    """``dstates`` None: one chunk per sequence, no initial state and no gradient of the final one,
+    so no gradient flows through a state."""
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = B.shape
@@ -279,7 +286,10 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == dt.shape
     assert dout.shape == x.shape
-    assert dstates.shape == (batch, nchunks, nheads, headdim, dstate)
+    if dstates is not None:
+        assert dstates.shape == (batch, nchunks, nheads, headdim, dstate)
+    else:
+        assert nchunks == 1, "without states every sequence must fit in one chunk"
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
     deterministic = use_deterministic_mode()
@@ -317,7 +327,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
                         batch * nchunks, nheads)
     with device_context(x.device):
         _chunk_scan_chunk_state_bwd_dx_kernel[grid_dx](
-            x, CB, dout, dt, dA_cumsum, seq_idx, D, B, dstates, dx, ddt, dD,
+            x, CB, dout, dt, dA_cumsum, seq_idx, D, B, dstates if dstates is not None else x, dx, ddt, dD,
             chunk_size, headdim, dstate,
             batch, seqlen, nheads // ngroups,
             x.stride(0), x.stride(1), x.stride(2), x.stride(3),
@@ -328,7 +338,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             D.stride(0) if D is not None else 0,
             B.stride(0), B.stride(1), B.stride(2), B.stride(3),
-            dstates.stride(0), dstates.stride(1), dstates.stride(2), dstates.stride(3), dstates.stride(4),
+            *(dstates.stride() if dstates is not None else (0, 0, 0, 0, 0)),
             dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
             ddt.stride(0), ddt.stride(2), ddt.stride(1), ddt.stride(3), stride_ddt_tile,
             dD_strides[1], dD_strides[2], dD_strides[3], dD_strides[0], dD_strides[4],
@@ -338,6 +348,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
             BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
             IS_TRITON_22=TRITON_22,
             DETERMINISTIC_REDUCTION=deterministic,
+            HAS_STATES=dstates is not None,
         )
     if D is not None:
         BLOCK_SIZE_actual = _chunk_scan_chunk_state_bwd_dx_kernel.best_config.kwargs["BLOCK_SIZE_M"]
@@ -350,7 +361,26 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt, dD
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), state_dtype=None):
+def _single_chunk(seqlen, chunk_size, initial_states, seq_idx):
+    """Whether the scan can leave out the states between chunks: every sequence fits in one chunk and
+    starts from nothing (MAMBA_SINGLE_CHUNK=0 always takes the full path).
+
+    The chunked scan works out the state each chunk ends in, passes the states from chunk to chunk
+    and lets every chunk read the state it starts from; the backward does all of it again in
+    reverse.  A sequence of one chunk with no initial state starts from zeros and has nothing after
+    it, so that machinery only computes zeros or a final state.  Without it the answers are the same
+    to the bit: what is left out only ever contributed zeros.  Choosing a chunk that holds the whole
+    sequence, as long as it is short, is then the cheap way to scan: on an RTX 5090, a layer of 40
+    sequences of 352 tokens took 5.5 ms for one chunk of 512 against 7.5 ms for three of 128, with
+    d_state 256.
+    """
+    return (seqlen <= chunk_size and initial_states is None and seq_idx is None
+            and os.environ.get("MAMBA_SINGLE_CHUNK", "1") != "0")
+
+
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), state_dtype=None, return_final_states=True):
+    """``return_final_states`` False: the caller will not read them, so a scan of one chunk per
+    sequence (``_single_chunk``) need not work out any state, and returns None for both."""
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -382,6 +412,10 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp2, dt_tmp2 = _chunk_cumsum_fwd(dt[:, 147:256], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
+    if not return_final_states and cu_seqlens is None and _single_chunk(seqlen, chunk_size, initial_states, seq_idx):
+        CB = _bmm_chunk_fwd(C, B, chunk_size, output_dtype=torch.float32)
+        out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, None, D=D, z=z)
+        return out, out_x, dt, dA_cumsum, None, None
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
     # states_tmp0 = _chunk_state_fwd(B[:, :147], x[:, :147], dt_tmp0, dA_cumsum_tmp0, states_in_fp32=True)
     # states_tmp1 = _chunk_state_fwd(B[:, 147:], x[:, 147:], dt_tmp1, dA_cumsum_tmp1, states_in_fp32=True)
@@ -451,6 +485,25 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     dA_cumsum, dt = _chunk_cumsum_fwd(dt_in, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus,
                                       dt_limit=dt_limit)
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    if dfinal_states is None and _single_chunk(seqlen, chunk_size, initial_states, seq_idx):
+        # Nothing flows back through a state: no recomputed states, no state passing either way,
+        # and none of what B, C and the decay receive through them.
+        if z is not None:
+            dz, dout, dD, *rest = _chunk_scan_bwd_dz(x, z, out, dout, chunk_size=chunk_size, has_ddAcs=False, D=D, dz=dz, recompute_output=recompute_output)
+            outz = rest[0] if recompute_output else out
+        else:
+            dz = None
+            outz = out
+        dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, None, D=D, dx=dx)
+        dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, ngroups=ngroups).to(CB.dtype)
+        _bmm_chunk_bwd(C, dCB, out=dB_given)
+        _bmm_chunk_bwd(B, rearrange(dCB, "... l s -> ... s l"), out=dC_given)
+        if z is None:
+            dD = dD_from_x
+        ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
+        ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt, dt_in, A, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit, ddt=ddt_given)
+        return_vals = (dx, ddt_given, dA, dB_given, dC_given, dD, dz, ddt_bias, None)
+        return return_vals if not recompute_output else (*return_vals, outz)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
     states, _ = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
                                    initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
@@ -612,7 +665,7 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
             cu_seqlens = None
         else:
             assert cu_seqlens is not None, "cu_seqlens must be provided if return_varlen_states is True"
-        out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit, state_dtype=state_dtype)
+        out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit, state_dtype=state_dtype, return_final_states=return_final_states)
         ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
         ctx.dt_softplus = dt_softplus
         ctx.chunk_size = chunk_size
@@ -862,13 +915,13 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
         if rmsnorm_weight is None:
-            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, state_dtype=state_dtype)
+            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, state_dtype=state_dtype, return_final_states=return_final_states)
             out = rearrange(out, "b s h p -> b s (h p)")
             rstd = None
             if d_nonssm > 0:
                 out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
         else:
-            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, state_dtype=state_dtype)
+            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, state_dtype=state_dtype, return_final_states=return_final_states)
             # reshape input data into 2D tensor
             x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
