@@ -29,6 +29,14 @@ except ImportError:
     causal_conv1d_bwd_function = None
     causal_conv1d_update_function = None
 
+from mamba_ssm.ops.triton import causal_conv1d_triton
+
+# The fused path's convolution: causal_conv1d's CUDA kernels where the package is installed, the
+# Triton ones without it (as on an Intel GPU) or with MAMBA_TRITON_CONV=1.
+if causal_conv1d_fwd_function is None or causal_conv1d_triton.preferred():
+    causal_conv1d_fwd_function = causal_conv1d_triton.causal_conv1d_fwd_function
+    causal_conv1d_bwd_function = causal_conv1d_triton.causal_conv1d_bwd_function
+
 from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
 from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
 from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
