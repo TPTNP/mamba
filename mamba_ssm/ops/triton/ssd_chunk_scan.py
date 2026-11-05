@@ -1565,7 +1565,10 @@ def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1
             HAS_SEQ_IDX=seq_idx is not None,
             BLOCK_SIZE_K=max(triton.next_power_of_2(headdim), 16),
         )
-    dcb = dcb.sum(2)
+    # The splits' partial sums over heads.  With one split -- every head of a group in one program,
+    # whenever there are more batch chunks and heads than cores -- there is nothing to add, and the
+    # sum would only copy the whole of dcb.
+    dcb = dcb.squeeze(2) if nsplits == 1 else dcb.sum(2)
     if ddA_cumsum is not None:
         BLOCK_SIZE_M_actual = _chunk_scan_bwd_dcb_kernel.best_config.kwargs["BLOCK_SIZE_M"]
         n_valid_blocks = (chunk_size + BLOCK_SIZE_M_actual - 1) // BLOCK_SIZE_M_actual
