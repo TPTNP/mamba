@@ -2,10 +2,14 @@ import torch
 from functools import partial
 from typing import Callable
 
+from mamba_ssm.utils.device import autocast_device_type
+
 def custom_amp_decorator(dec: Callable, cuda_amp_deprecated: bool):
     def decorator(*args, **kwargs):
         if cuda_amp_deprecated:
-            kwargs["device_type"] = "cuda"
+            # The autocast a custom function records and replays: CUDA's, or an Intel GPU's where
+            # PyTorch has one and no CUDA.
+            kwargs["device_type"] = autocast_device_type()
         return dec(*args, **kwargs)
     return decorator
 

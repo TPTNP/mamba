@@ -1,5 +1,16 @@
 # Mamba
 
+> **This is TPTNP's fork of [state-spaces/mamba](https://github.com/state-spaces/mamba).** It adds
+> Intel GPU (PyTorch XPU) support for Mamba2's Triton path, as run on ALCF Aurora; further changes
+> land here as they are made. Upstream's code is otherwise unchanged, and on CUDA the results
+> match it. Install it on an Intel GPU without the CUDA extensions, which Mamba2 does not need:
+>
+> ```
+> pip install --no-build-isolation --no-deps git+https://github.com/TPTNP/mamba
+> ```
+>
+> `MAMBA_XPU_NORM_GRID` (default 8) sets how many programs per Xe core the norms' backward kernels use.
+
 ![Mamba](assets/selection.png "Selective State Space")
 > **Mamba: Linear-Time Sequence Modeling with Selective State Spaces**\
 > Albert Gu*, Tri Dao*\
