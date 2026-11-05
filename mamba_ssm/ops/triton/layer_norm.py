@@ -745,6 +745,7 @@ class LayerNormFn(torch.autograd.Function):
         residual_in_fp32=False,
         is_rms_norm=False,
         return_dropout_mask=False,
+        out_dtype=None,
     ):
         x_shape_og = x.shape
         # reshape input data into 2D tensor
@@ -787,6 +788,7 @@ class LayerNormFn(torch.autograd.Function):
             bias1,
             dropout_p=dropout_p,
             rowscale=rowscale,
+            out_dtype=out_dtype,
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
             return_dropout_mask=return_dropout_mask,
@@ -884,6 +886,7 @@ class LayerNormFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -902,7 +905,12 @@ def layer_norm_fn(
     residual_in_fp32=False,
     is_rms_norm=False,
     return_dropout_mask=False,
+    out_dtype=None,
 ):
+    """``out_dtype``: the dtype the kernel writes the output in (default: the input's).  For a norm
+    whose output goes straight into a matmul under autocast, the autocast dtype: the kernel rounds
+    as it stores, as autocast's cast would, and its backward reads the gradient in that dtype into
+    float32 exactly, so the cast's pass each way over the activations is left out."""
     return LayerNormFn.apply(
         x,
         weight,
@@ -918,6 +926,7 @@ def layer_norm_fn(
         residual_in_fp32,
         is_rms_norm,
         return_dropout_mask,
+        out_dtype,
     )
 
 
@@ -935,7 +944,9 @@ def rms_norm_fn(
     prenorm=False,
     residual_in_fp32=False,
     return_dropout_mask=False,
+    out_dtype=None,
 ):
+    """``out_dtype`` as for ``layer_norm_fn``."""
     return LayerNormFn.apply(
         x,
         weight,
@@ -951,6 +962,7 @@ def rms_norm_fn(
         residual_in_fp32,
         True,
         return_dropout_mask,
+        out_dtype,
     )
 
 
