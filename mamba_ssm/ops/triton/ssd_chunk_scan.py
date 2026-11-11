@@ -78,13 +78,15 @@ def _chunk_scan_fwd_kernel(
     # state starts from zeros, and the whole term C @ prev_states is left out.
     HAS_STATES: tl.constexpr = True,
 ):
-    pid_bc = tl.program_id(axis=1)
+    # Heads vary fastest, then tiles, then chunks, so the heads of a group read its shared
+    # tiles together while they are in L2 (as _chunk_scan_chunk_state_bwd_dx_kernel).
+    pid_bc = tl.program_id(axis=2)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
-    pid_h = tl.program_id(axis=2)
+    pid_h = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
-    pid_m = tl.program_id(axis=0) // num_pid_n
-    pid_n = tl.program_id(axis=0) % num_pid_n
+    pid_m = tl.program_id(axis=1) // num_pid_n
+    pid_n = tl.program_id(axis=1) % num_pid_n
     cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
@@ -468,13 +470,15 @@ def _chunk_scan_bwd_dstates_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_bc = tl.program_id(axis=1)
+    # Heads vary fastest, then tiles, then chunks, so the heads of a group read its shared
+    # tiles together while they are in L2 (as _chunk_scan_chunk_state_bwd_dx_kernel).
+    pid_bc = tl.program_id(axis=2)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
-    pid_h = tl.program_id(axis=2)
+    pid_h = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
-    pid_m = tl.program_id(axis=0) // num_pid_n
-    pid_n = tl.program_id(axis=0) % num_pid_n
+    pid_m = tl.program_id(axis=1) // num_pid_n
+    pid_n = tl.program_id(axis=1) % num_pid_n
     c_ptr += pid_b * stride_c_batch + pid_c * chunk_size * stride_c_seqlen + (pid_h // nheads_ngroups_ratio) * stride_c_head
     dout_ptr += pid_b * stride_dout_batch + pid_c * chunk_size * stride_dout_seqlen + pid_h * stride_dout_head
     dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
@@ -1118,11 +1122,13 @@ def _chunk_scan_bwd_ddAcs_stable_kernel(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_bc = tl.program_id(axis=1)
+    # Heads vary fastest, then tiles, then chunks, so the heads of a group read its shared
+    # tiles together while they are in L2 (as _chunk_scan_chunk_state_bwd_dx_kernel).
+    pid_bc = tl.program_id(axis=2)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
-    pid_h = tl.program_id(axis=2)
-    pid_m = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
 
     x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
     dout_ptr += pid_b * stride_dout_batch + pid_c * chunk_size * stride_dout_seqlen + pid_h * stride_dout_head
@@ -1289,8 +1295,8 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         assert out_x.stride() == out.stride()
     else:
         out_x = None
-    grid = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
-                    batch * nchunks, nheads)
+    grid = lambda META: (nheads, triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
+                         batch * nchunks)
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                   if z is not None else (0, 0, 0, 0))
     _chunk_scan_fwd_kernel[grid](
@@ -1442,8 +1448,8 @@ def _chunk_scan_bwd_dstates(C, dA_cumsum, dout, seq_idx=None, dtype=None):
         assert seq_idx.shape == (batch, seqlen)
     dtype = C.dtype if dtype is None else dtype
     dprev_states = torch.empty(batch, nchunks, nheads, headdim, dstate, device=C.device, dtype=dtype)
-    grid_dstates = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
-                            batch * nchunks, nheads)
+    grid_dstates = lambda META: (nheads, triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
+                                 batch * nchunks)
     with device_context(C.device):
         _chunk_scan_bwd_dstates_kernel[grid_dstates](
             dout, C, dprev_states, dA_cumsum, seq_idx,
@@ -1723,7 +1729,7 @@ def _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, cb):
     BLOCK_SIZE_M_min = 32
     ddA_cumsum = torch.empty(batch, nheads, nchunks, triton.cdiv(chunk_size, BLOCK_SIZE_M_min),
                              chunk_size, device=x.device, dtype=torch.float32)
-    grid_ddtcs = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']), batch * nchunks, nheads)
+    grid_ddtcs = lambda META: (nheads, triton.cdiv(chunk_size, META['BLOCK_SIZE_M']), batch * nchunks)
     with device_context(x.device):
         _chunk_scan_bwd_ddAcs_stable_kernel[grid_ddtcs](
             x, dout, dt, dA_cumsum, cb, ddA_cumsum,

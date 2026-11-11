@@ -134,13 +134,15 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
     # state and no gradient of the final one, none does, and the term B @ dstates is left out.
     HAS_STATES: tl.constexpr = True,
 ):
-    pid_bc = tl.program_id(axis=1)
+    # Heads vary fastest, then tiles, then chunks: the programs reading a chunk's CB and dout run
+    # together, and the heads of a group share each CB tile while it is in L2.
+    pid_bc = tl.program_id(axis=2)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
-    pid_h = tl.program_id(axis=2)
+    pid_h = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
-    pid_m = tl.program_id(axis=0) // num_pid_n
-    pid_n = tl.program_id(axis=0) % num_pid_n
+    pid_m = tl.program_id(axis=1) // num_pid_n
+    pid_n = tl.program_id(axis=1) % num_pid_n
     x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
     cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     dout_ptr += pid_b * stride_dout_batch + pid_c * chunk_size * stride_dout_seqlen + pid_h * stride_dout_head
@@ -329,8 +331,8 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
         deterministic,
         zero_init=True,
     )
-    grid_dx = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
-                        batch * nchunks, nheads)
+    grid_dx = lambda META: (nheads, triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
+                            batch * nchunks)
     with device_context(x.device):
         _chunk_scan_chunk_state_bwd_dx_kernel[grid_dx](
             x, CB, dout, dt, dA_cumsum, seq_idx, D, B, dstates if dstates is not None else x, dx, ddt, dD,
