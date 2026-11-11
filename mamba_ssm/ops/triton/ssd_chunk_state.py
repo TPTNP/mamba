@@ -208,13 +208,15 @@ def _chunk_state_fwd_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_bc = tl.program_id(axis=1)
+    # Heads vary fastest, then tiles, then chunks, so the heads of a group read its shared
+    # tiles together while they are in L2 (as _chunk_scan_chunk_state_bwd_dx_kernel).
+    pid_bc = tl.program_id(axis=2)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
-    pid_h = tl.program_id(axis=2)
+    pid_h = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
-    pid_m = tl.program_id(axis=0) // num_pid_n
-    pid_n = tl.program_id(axis=0) % num_pid_n
+    pid_m = tl.program_id(axis=1) // num_pid_n
+    pid_n = tl.program_id(axis=1) % num_pid_n
     b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
     x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
@@ -826,8 +828,8 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_f
     else:
         states_dtype = torch.float32 if states_in_fp32 else B.dtype
         states = torch.empty((batch, nchunks, nheads, headdim, dstate), device=x.device, dtype=states_dtype)
-    grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
-                    batch * nchunks, nheads)
+    grid = lambda META: (nheads, triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
+                         batch * nchunks)
     with device_context(x.device):
         _chunk_state_fwd_kernel[grid](
             x, B, states, dt, dA_cumsum, seq_idx,
