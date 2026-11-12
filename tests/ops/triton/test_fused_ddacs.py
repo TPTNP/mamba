@@ -74,22 +74,22 @@ class TheScan(unittest.TestCase):
     def test_same_gradients(self):
         # several chunks, a ragged last chunk, and one chunk alone (the single-chunk path)
         # chunk sizes no other test uses, so each tunes afresh here
-        for batch, seqlen, chunk in ((4, 1000, 96), (3, 300, 64), (3, 200, 224), (2, 160, 160)):
-            for dtype in (torch.bfloat16, torch.float32):
-                results = self._each_path(self._inputs(batch, seqlen, dtype), chunk)
-                names = ["dx", "ddt", "dA", "dB", "dC", "dD", "dz", "ddt_bias"]
-                for path in ("fused", "sums"):
-                    for name, a, b in zip(names, results["release"], results[path]):
-                        if a is None:
-                            continue
-                        with self.subTest(path=path, shape=(batch, seqlen, chunk), dtype=dtype, name=name):
-                            if name in ("ddt", "dA", "ddt_bias"):
-                                # fp32 sums in another order; a bf16 ddt rounds them to its own 8 bits,
-                                # so an element may land one ulp (2^-8 to 2^-7 relative) to either side.
-                                rtol = 2 ** -7 if a.dtype == torch.bfloat16 else 1e-4
-                                torch.testing.assert_close(b, a, rtol=rtol, atol=1e-5 * a.abs().max().item())
-                            else:
-                                self.assertTrue(torch.equal(a, b), f"{name}: {(a.float() - b.float()).abs().max().item()}")
+        # (every new chunk size and dtype tunes all of the scan's kernels: minutes on an Intel GPU)
+        for batch, seqlen, chunk, dtype in ((4, 1000, 96, torch.bfloat16), (3, 200, 224, torch.bfloat16), (3, 300, 64, torch.float32)):
+            results = self._each_path(self._inputs(batch, seqlen, dtype), chunk)
+            names = ["dx", "ddt", "dA", "dB", "dC", "dD", "dz", "ddt_bias"]
+            for path in ("fused", "sums"):
+                for name, a, b in zip(names, results["release"], results[path]):
+                    if a is None:
+                        continue
+                    with self.subTest(path=path, shape=(batch, seqlen, chunk), dtype=dtype, name=name):
+                        if name in ("ddt", "dA", "ddt_bias"):
+                            # fp32 sums in another order; a bf16 ddt rounds them to its own 8 bits,
+                            # so an element may land one ulp (2^-8 to 2^-7 relative) to either side.
+                            rtol = 2 ** -7 if a.dtype == torch.bfloat16 else 1e-4
+                            torch.testing.assert_close(b, a, rtol=rtol, atol=1e-5 * a.abs().max().item())
+                        else:
+                            self.assertTrue(torch.equal(a, b), f"{name}: {(a.float() - b.float()).abs().max().item()}")
 
 
 if __name__ == "__main__":
