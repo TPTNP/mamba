@@ -37,7 +37,7 @@ class TheChoice(unittest.TestCase):
 
 @unittest.skipUnless(_accelerator() is not None, "the scan's Triton kernels run on a GPU")
 class TheScan(unittest.TestCase):
-    """_mamba_chunk_scan_combined_bwd with ddA_cumsum from the dcb kernel, against the separate kernel."""
+    """_mamba_chunk_scan_combined_bwd with ddA_cumsum from tile sums, against the release's kernel."""
 
     def _inputs(self, batch, seqlen, dtype):
         device = _accelerator()
@@ -51,7 +51,14 @@ class TheScan(unittest.TestCase):
                     D=torch.randn(nheads, device=device), dt_bias=dt0 + torch.log(-torch.expm1(-dt0)),
                     dout=r(batch, seqlen, nheads, headdim))
 
-    def _both(self, v, chunk):
+    # The three ways to ddA_cumsum: the dcb kernel's tile sums (the default), the separate kernel
+    # with row and column sums (MAMBA_FUSED_DDACS=0), and the separate kernel's own per-row cumsum
+    # as the release has it (MAMBA_FUSED_DDACS=0 MAMBA_DDACS_SUMS=0), the one both are held to.
+    PATHS = (("fused", {"MAMBA_FUSED_DDACS": "1"}),
+             ("sums", {"MAMBA_FUSED_DDACS": "0", "MAMBA_DDACS_SUMS": "1"}),
+             ("release", {"MAMBA_FUSED_DDACS": "0", "MAMBA_DDACS_SUMS": "0"}))
+
+    def _each_path(self, v, chunk):
         out, *_ = ssd_combined._mamba_chunk_scan_combined_fwd(
             v["x"], v["dt"], v["A"], v["B"], v["C"], chunk, D=v["D"], dt_bias=v["dt_bias"], dt_softplus=True)
         args = (v["dout"], v["x"], v["dt"], v["A"], v["B"], v["C"], out, chunk)
@@ -59,26 +66,30 @@ class TheScan(unittest.TestCase):
         # The fused path first, so that the dcb kernel tunes inside it: the autotuner runs every
         # config on the same partial-sum buffers, and the sums must read only the chosen one's.
         results = {}
-        for fused in ("1", "0"):
-            with patch.dict(os.environ, {"MAMBA_FUSED_DDACS": fused}):
-                results[fused] = ssd_combined._mamba_chunk_scan_combined_bwd(*args, **options)
-        return results["0"], results["1"]
+        for path, environment in self.PATHS:
+            with patch.dict(os.environ, environment):
+                results[path] = ssd_combined._mamba_chunk_scan_combined_bwd(*args, **options)
+        return results
 
     def test_same_gradients(self):
         # several chunks, a ragged last chunk, and one chunk alone (the single-chunk path)
         # chunk sizes no other test uses, so each tunes afresh here
         for batch, seqlen, chunk in ((4, 1000, 96), (3, 300, 64), (3, 200, 224), (2, 160, 160)):
             for dtype in (torch.bfloat16, torch.float32):
-                separate, fused = self._both(self._inputs(batch, seqlen, dtype), chunk)
+                results = self._each_path(self._inputs(batch, seqlen, dtype), chunk)
                 names = ["dx", "ddt", "dA", "dB", "dC", "dD", "dz", "ddt_bias"]
-                for name, a, b in zip(names, separate, fused):
-                    if a is None:
-                        continue
-                    with self.subTest(shape=(batch, seqlen, chunk), dtype=dtype, name=name):
-                        if name in ("ddt", "dA", "ddt_bias"):
-                            torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5 * a.abs().max().item())
-                        else:
-                            self.assertTrue(torch.equal(a, b), f"{name}: {(a.float() - b.float()).abs().max().item()}")
+                for path in ("fused", "sums"):
+                    for name, a, b in zip(names, results["release"], results[path]):
+                        if a is None:
+                            continue
+                        with self.subTest(path=path, shape=(batch, seqlen, chunk), dtype=dtype, name=name):
+                            if name in ("ddt", "dA", "ddt_bias"):
+                                # fp32 sums in another order; a bf16 ddt rounds them to its own 8 bits,
+                                # so an element may land one ulp (2^-8 to 2^-7 relative) to either side.
+                                rtol = 2 ** -7 if a.dtype == torch.bfloat16 else 1e-4
+                                torch.testing.assert_close(b, a, rtol=rtol, atol=1e-5 * a.abs().max().item())
+                            else:
+                                self.assertTrue(torch.equal(a, b), f"{name}: {(a.float() - b.float()).abs().max().item()}")
 
 
 if __name__ == "__main__":
