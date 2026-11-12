@@ -1,3 +1,4 @@
+import os
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 """We want triton==2.1.0 or 2.2.0 for this
@@ -784,7 +785,7 @@ _CHUNK_SCAN_BWD_DX_MIN_BLOCK_N = min(
 def _chunk_scan_bwd_dcb_kernel(
     # Pointers to matrices
     x_ptr, dout_ptr, cb_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
-    dcb_ptr, ddA_cumsum_ptr,
+    dcb_ptr, ddA_cumsum_ptr, ddA_row_ptr,
     # Matrix dimensions
     chunk_size, hdim,
     batch, seqlen, nheads, nheads_per_program, ngroups,
@@ -797,6 +798,7 @@ def _chunk_scan_bwd_dcb_kernel(
     stride_seq_idx_batch, stride_seq_idx_seqlen,
     stride_dcb_batch, stride_dcb_chunk, stride_dcb_split, stride_dcb_group, stride_dcb_csize_m, stride_dcb_csize_n,
     stride_ddA_cs_batch, stride_ddA_cs_chunk, stride_ddA_cs_head, stride_ddA_cs_csize_m, stride_ddA_cs_csize_n,
+    stride_ddA_row_batch, stride_ddA_row_chunk, stride_ddA_row_head, stride_ddA_row_tile, stride_ddA_row_csize,
     # Meta-parameters
     HAS_DDA_CS: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
@@ -819,6 +821,7 @@ def _chunk_scan_bwd_dcb_kernel(
     if HAS_DDA_CS:
         cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + pid_g * stride_cb_head
         ddA_cumsum_ptr += pid_b * stride_ddA_cs_batch + pid_c * stride_ddA_cs_chunk + (pid_g * (nheads // ngroups) + pid_s * nheads_per_program) * stride_ddA_cs_head + pid_m * stride_ddA_cs_csize_m
+        ddA_row_ptr += pid_b * stride_ddA_row_batch + pid_c * stride_ddA_row_chunk + (pid_g * (nheads // ngroups) + pid_s * nheads_per_program) * stride_ddA_row_head + pid_n * stride_ddA_row_tile
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
@@ -831,11 +834,18 @@ def _chunk_scan_bwd_dcb_kernel(
     if HAS_DDA_CS:
         cb_ptrs = cb_ptr + (offs_m[:, None] * stride_cb_csize_m + offs_n[None, :] * stride_cb_csize_n)
         ddA_cumsum_ptrs = ddA_cumsum_ptr + offs_n * stride_ddA_cs_csize_n
+        ddA_row_ptrs = ddA_row_ptr + offs_m * stride_ddA_row_csize
 
     if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
         dcb_ptr += pid_b * stride_dcb_batch + pid_c * stride_dcb_chunk + pid_g * stride_dcb_group + pid_s * stride_dcb_split
         dcb_ptrs = dcb_ptr + (offs_m[:, None] * stride_dcb_csize_m + offs_n[None, :] * stride_dcb_csize_n)
         tl.store(dcb_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=dcb_ptr.dtype.element_ty), mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+        if HAS_DDA_CS:
+            # Above the diagonal every pair is zero; written all the same, since the autotuner runs
+            # each config on the same buffers and the caller sums whole tile rows and columns.
+            for h in range(min(nheads_per_program, nheads // ngroups - pid_s * nheads_per_program)):
+                tl.store(ddA_cumsum_ptrs + h * stride_ddA_cs_head, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32), mask=offs_n < chunk_size)
+                tl.store(ddA_row_ptrs + h * stride_ddA_row_head, tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32), mask=offs_m < chunk_size)
         return
 
     chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
@@ -856,22 +866,21 @@ def _chunk_scan_bwd_dcb_kernel(
         dcb *= tl.exp(tl.minimum((dA_cs_m[:, None] - dA_cs_n[None, :]), 0.0))
         if HAS_DDA_CS:
             tl.static_assert(not HAS_SEQ_IDX, "HAS_SEQ_IDX not supported with HAS_DDA_CS yet")
-            ddA_cs = dcb * cb
-            mask = offs_m[:, None] >= offs_n[None, :] + 1
-            ddA_cs = tl.where(mask, ddA_cs, 0.0)
-            ddA_cs = tl.cumsum(ddA_cs, axis=1)
-            ddA_cs = tl.where(mask, ddA_cs, 0.0)
-            ddA_cs = tl.sum(ddA_cs, axis=0)
-            tl.store(ddA_cumsum_ptrs + stride_ddA_cs_csize_n, ddA_cs, mask=offs_n < chunk_size - 1)
-            tl.store(ddA_cumsum_ptr, 0.0)
+            # ddA_cs[k] = sum_{m >= k, n < k} (dcb * cb)[m, n] over m > n telescopes to
+            # ddA_cs[k] - ddA_cs[k-1] = colsum[k-1] - rowsum[k-1]: this tile's column sums go to
+            # its row of tiles, its row sums to its column of tiles, and the caller adds them up
+            # and takes one cumsum over the chunk.
+            ddA_cs = tl.where(offs_m[:, None] >= offs_n[None, :] + 1, dcb * cb, 0.0)
+            tl.store(ddA_cumsum_ptrs, tl.sum(ddA_cs, axis=0), mask=offs_n < chunk_size)
+            tl.store(ddA_row_ptrs, tl.sum(ddA_cs, axis=1), mask=offs_m < chunk_size)
         acc += dcb
         dout_ptrs += stride_dout_head
         x_ptrs += stride_x_head
         dt_ptrs += stride_dt_head
         dA_cumsum_ptr += stride_dA_cs_head
         if HAS_DDA_CS:
-            ddA_cumsum_ptr += stride_ddA_cs_head
             ddA_cumsum_ptrs += stride_ddA_cs_head
+            ddA_row_ptrs += stride_ddA_row_head
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     if HAS_SEQ_IDX:
@@ -1528,6 +1537,24 @@ def _chunk_scan_bwd_dC(prev_states, dA_cumsum, dout, seq_idx=None, C=None, ngrou
     return dC if C is None else (dC, ddA_cumsum_prev)
 
 
+@triton.jit
+def _ddAcs_from_sums_kernel(col_ptr, row_ptr, out_ptr, n_col_tiles, n_row_tiles, chunk_size,
+                            stride_tile, stride_bhc, BLOCK: tl.constexpr):
+    # One (batch, head, chunk): add up the tiles' column and row sums, and ddA_cumsum[k] is the sum
+    # of colsum - rowsum over the positions before k.
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < chunk_size
+    col_ptr += pid * stride_bhc
+    row_ptr += pid * stride_bhc
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for t in range(n_col_tiles):
+        acc += tl.load(col_ptr + t * stride_tile + offs, mask=mask, other=0.0)
+    for t in range(n_row_tiles):
+        acc -= tl.load(row_ptr + t * stride_tile + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + pid * chunk_size + offs, tl.cumsum(acc, axis=0) - acc, mask=mask)
+
+
 def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
@@ -1539,14 +1566,18 @@ def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1
     if CB is not None:
         assert CB.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
         CB_strides = (CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(3), CB.stride(4))
-        BLOCK_SIZE_M_min = 16
-        ddA_cumsum = torch.empty(batch, nheads, nchunks, triton.cdiv(chunk_size, BLOCK_SIZE_M_min),
-                                chunk_size, device=x.device, dtype=torch.float32)
+        assert seq_idx is None
+        # Column sums per tile row and row sums per tile column, every tile writing its own (32 is
+        # the smallest block either way); only the chosen config's tiles are added up below, since
+        # the others' leave what they wrote while the autotuner timed them.
+        ddA_cumsum = torch.empty(batch, nheads, nchunks, triton.cdiv(chunk_size, 32), chunk_size, device=x.device, dtype=torch.float32)
+        ddA_row = torch.empty(batch, nheads, nchunks, triton.cdiv(chunk_size, 32), chunk_size, device=x.device, dtype=torch.float32)
         ddA_cumsum_strides = (ddA_cumsum.stride(0), ddA_cumsum.stride(2), ddA_cumsum.stride(1), ddA_cumsum.stride(3), ddA_cumsum.stride(4))
+        ddA_row_strides = (ddA_row.stride(0), ddA_row.stride(2), ddA_row.stride(1), ddA_row.stride(3), ddA_row.stride(4))
     else:
         CB_strides = (0, 0, 0, 0, 0)
-        ddA_cumsum = None
-        ddA_cumsum_strides = (0, 0, 0, 0, 0)
+        ddA_cumsum = ddA_row = None
+        ddA_cumsum_strides = ddA_row_strides = (0, 0, 0, 0, 0)
     nheads_ngroups_ratio = nheads // ngroups
     sm_count = core_count(x.device)
     nheads_per_program = max(min(math.ceil(batch * nchunks * nheads / sm_count), nheads_ngroups_ratio), 1)
@@ -1556,7 +1587,7 @@ def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1
                         batch * nchunks, nsplits * ngroups)
     with device_context(x.device):
         _chunk_scan_bwd_dcb_kernel[grid_dcb](
-            x, dout, CB, dt, dA_cumsum, seq_idx, dcb, ddA_cumsum,
+            x, dout, CB, dt, dA_cumsum, seq_idx, dcb, ddA_cumsum, ddA_row,
             chunk_size, headdim,
             batch, seqlen, nheads, nheads_per_program, ngroups,
             x.stride(0), x.stride(1), x.stride(2), x.stride(3),
@@ -1567,6 +1598,7 @@ def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             dcb.stride(0), dcb.stride(1), dcb.stride(2), dcb.stride(3), dcb.stride(4), dcb.stride(5),
             *ddA_cumsum_strides,
+            *ddA_row_strides,
             HAS_DDA_CS=ddA_cumsum is not None,
             HAS_SEQ_IDX=seq_idx is not None,
             BLOCK_SIZE_K=max(triton.next_power_of_2(headdim), 16),
@@ -1576,9 +1608,14 @@ def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1
     # sum would only copy the whole of dcb.
     dcb = dcb.squeeze(2) if nsplits == 1 else dcb.sum(2)
     if ddA_cumsum is not None:
-        BLOCK_SIZE_M_actual = _chunk_scan_bwd_dcb_kernel.best_config.kwargs["BLOCK_SIZE_M"]
-        n_valid_blocks = (chunk_size + BLOCK_SIZE_M_actual - 1) // BLOCK_SIZE_M_actual
-        ddA_cumsum = ddA_cumsum[:, :, :, :n_valid_blocks].sum(dim=3)
+        config = _chunk_scan_bwd_dcb_kernel.best_config.kwargs
+        out = torch.empty(batch, nheads, nchunks, chunk_size, device=x.device, dtype=torch.float32)
+        with device_context(x.device):
+            _ddAcs_from_sums_kernel[(batch * nheads * nchunks,)](
+                ddA_cumsum, ddA_row, out,
+                triton.cdiv(chunk_size, config["BLOCK_SIZE_M"]), triton.cdiv(chunk_size, config["BLOCK_SIZE_N"]), chunk_size,
+                ddA_cumsum.stride(3), ddA_cumsum.stride(2), BLOCK=triton.next_power_of_2(chunk_size))
+        ddA_cumsum = out
     return dcb if CB is None else (dcb, ddA_cumsum)
 
 
@@ -1718,6 +1755,8 @@ def _chunk_scan_bwd_ddAcs_stable_old(x, dt, dA_cumsum, dout, cb):
 
 
 def _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, cb):
+    if os.environ.get("MAMBA_DDACS_SUMS", "1") == "1":
+        return _chunk_scan_bwd_ddAcs_sums(x, dt, dA_cumsum, dout, cb)
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
@@ -1746,6 +1785,115 @@ def _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, cb):
     BLOCK_SIZE_M_actual = _chunk_scan_bwd_ddAcs_stable_kernel.best_config.kwargs["BLOCK_SIZE_M"]
     n_valid_blocks = (chunk_size + BLOCK_SIZE_M_actual - 1) // BLOCK_SIZE_M_actual
     ddA_cumsum = ddA_cumsum[:, :, :, :n_valid_blocks].sum(dim=3)
+    return ddA_cumsum
+
+
+@triton.autotune(
+    configs=autotune_configs([
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=8),
+    ]),
+    key=['chunk_size', 'hdim'],
+)
+@triton.jit
+def _chunk_scan_bwd_ddAcs_sums_kernel(
+    x_ptr, dout_ptr, dt_ptr, dA_cumsum_ptr, cb_ptr,
+    colsum_ptr, rowsum_ptr,
+    chunk_size, hdim,
+    batch, seqlen, nheads_ngroups_ratio,
+    stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
+    stride_dout_batch, stride_dout_seqlen, stride_dout_head, stride_dout_hdim,
+    stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
+    stride_cb_batch, stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_n,
+    stride_col_batch, stride_col_chunk, stride_col_head, stride_col_csize_m, stride_col_csize_n,
+    stride_row_batch, stride_row_chunk, stride_row_head, stride_row_csize,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+):
+    # The stable kernel's acc[m, n] (m > n), but instead of each row's cumsum only its row and
+    # column sums: ddA_cs[k] = sum_{m >= k, n < k} acc[m, n] telescopes to
+    # ddA_cs[k] - ddA_cs[k-1] = colsum[k-1] - rowsum[k-1], so one cumsum over the chunk finishes it.
+    pid_bc = tl.program_id(axis=2)
+    pid_c = pid_bc // batch
+    pid_b = pid_bc - pid_c * batch
+    pid_h = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
+    dout_ptr += pid_b * stride_dout_batch + pid_c * chunk_size * stride_dout_seqlen + pid_h * stride_dout_head
+    dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
+    dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+    cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
+    colsum_ptr += pid_b * stride_col_batch + pid_c * stride_col_chunk + pid_h * stride_col_head + pid_m * stride_col_csize_m
+    rowsum_ptr += pid_b * stride_row_batch + pid_c * stride_row_chunk + pid_h * stride_row_head
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    dout_ptrs = dout_ptr + (offs_m[:, None] * stride_dout_seqlen + offs_k[None, :] * stride_dout_hdim)
+    x_ptrs = x_ptr + (offs_n[None, :] * stride_x_seqlen + offs_k[:, None] * stride_x_hdim)
+    dt_ptrs = dt_ptr + offs_n * stride_dt_csize
+    cb_ptrs = cb_ptr + (offs_m[:, None] * stride_cb_csize_m + offs_n[None, :] * stride_cb_csize_n)
+    col_ptrs = colsum_ptr + offs_n * stride_col_csize_n
+
+    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    rowsum = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    dout = tl.load(dout_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < hdim), other=0.0)
+    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize, mask=offs_m < chunk_size, other=0.0).to(tl.float32)
+    hi = (pid_m + 1) * BLOCK_SIZE_M
+    for start_n in range(0, hi, BLOCK_SIZE_N):
+        start_n = tl.multiple_of(start_n, BLOCK_SIZE_N)
+        x = tl.load(x_ptrs, mask=(offs_k[:, None] < hdim) & (offs_n[None, :] < chunk_size_limit - start_n), other=0.0)
+        acc = tl.dot(dout, x)
+        dt_n = tl.load(dt_ptrs, mask=offs_n < chunk_size - start_n, other=0.0).to(tl.float32)
+        cb = tl.load(cb_ptrs, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size - start_n), other=0.0).to(tl.float32)
+        dA_cs_n = tl.load(dA_cumsum_ptr + (start_n + offs_n) * stride_dA_cs_csize, mask=offs_n < chunk_size - start_n, other=0.0).to(tl.float32)
+        acc *= dt_n[None, :] * cb * tl.exp(tl.minimum((dA_cs_m[:, None] - dA_cs_n[None, :]), 0.0))
+        acc = tl.where(offs_m[:, None] >= start_n + offs_n[None, :] + 1, acc, 0.0)
+        rowsum += tl.sum(acc, axis=1)
+        tl.store(col_ptrs, tl.sum(acc, axis=0), mask=offs_n < chunk_size - start_n)
+        x_ptrs += BLOCK_SIZE_N * stride_x_seqlen
+        dt_ptrs += BLOCK_SIZE_N * stride_dt_csize
+        cb_ptrs += BLOCK_SIZE_N * stride_cb_csize_n
+        col_ptrs += BLOCK_SIZE_N * stride_col_csize_n
+    for start_n in range(hi, chunk_size, BLOCK_SIZE_N):
+        tl.store(col_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32), mask=offs_n < chunk_size - start_n)
+        col_ptrs += BLOCK_SIZE_N * stride_col_csize_n
+    tl.store(rowsum_ptr + offs_m * stride_row_csize, rowsum, mask=offs_m < chunk_size)
+
+
+def _chunk_scan_bwd_ddAcs_sums(x, dt, dA_cumsum, dout, cb):
+    """_chunk_scan_bwd_ddAcs_stable without its per-row cumsum: equal up to fp32 summation order."""
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, nchunks, chunk_size = dt.shape
+    ngroups = cb.shape[2]
+    colsum = torch.empty(batch, nheads, nchunks, triton.cdiv(chunk_size, 32), chunk_size, device=x.device, dtype=torch.float32)
+    rowsum = torch.empty(batch, nheads, nchunks, chunk_size, device=x.device, dtype=torch.float32)
+    grid = lambda META: (nheads, triton.cdiv(chunk_size, META['BLOCK_SIZE_M']), batch * nchunks)
+    with device_context(x.device):
+        _chunk_scan_bwd_ddAcs_sums_kernel[grid](
+            x, dout, dt, dA_cumsum, cb, colsum, rowsum,
+            chunk_size, headdim,
+            batch, seqlen, nheads // ngroups,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
+            dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
+            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
+            cb.stride(0), cb.stride(1), cb.stride(2), cb.stride(3), cb.stride(4),
+            colsum.stride(0), colsum.stride(2), colsum.stride(1), colsum.stride(3), colsum.stride(4),
+            rowsum.stride(0), rowsum.stride(2), rowsum.stride(1), rowsum.stride(3),
+            BLOCK_SIZE_K=max(triton.next_power_of_2(headdim), 16),
+        )
+    blocks = triton.cdiv(chunk_size, _chunk_scan_bwd_ddAcs_sums_kernel.best_config.kwargs["BLOCK_SIZE_M"])
+    step = colsum[:, :, :, :blocks].sum(dim=3) - rowsum
+    ddA_cumsum = torch.zeros_like(rowsum)
+    torch.cumsum(step[..., :-1], dim=-1, out=ddA_cumsum[..., 1:])
     return ddA_cumsum
 
 

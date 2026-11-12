@@ -508,12 +508,18 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
             dz = None
             outz = out
         dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, None, D=D, dx=dx)
-        dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, ngroups=ngroups).to(CB.dtype)
+        if _fused_ddacs():
+            dCB, ddA = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, CB=CB, ngroups=ngroups)
+            dCB = dCB.to(CB.dtype)
+        else:
+            dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, ngroups=ngroups).to(CB.dtype)
+            ddA = None
         _bmm_chunk_bwd(C, dCB, out=dB_given)
         _bmm_chunk_bwd(B, rearrange(dCB, "... l s -> ... s l"), out=dC_given)
         if z is None:
             dD = dD_from_x
-        ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
+        if ddA is None:
+            ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
         ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt, dt_in, A, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit, ddt=ddt_given)
         return_vals = (dx, ddt_given, dA, dB_given, dC_given, dD, dz, ddt_bias, None)
         return return_vals if not recompute_output else (*return_vals, outz)
@@ -563,7 +569,11 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     # dC = _chunk_scan_bwd_dC(states[:, :-1].to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
     dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(states.to(state_dtype if state_dtype is not None else x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups)
     # Computing ddA with the dcb kernel is much slower, so we're not using it for now
-    dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
+    if seq_idx is None and _fused_ddacs():
+        dCB, ddA = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, CB=CB, ngroups=ngroups)
+    else:
+        dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
+        ddA = None
     # dCB, ddA_tmp = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, CB=CB, ngroups=ngroups)
     dCB = dCB.to(CB.dtype)
     _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given)
@@ -584,7 +594,8 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     # This is already done as part of bwd_dB kernel
     # ddA_next = _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=seq_idx)
     # We don't need to pass in seq_idx because CB also zeros out entries where seq_idx[i] != seq_idx[j]
-    ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
+    if ddA is None:
+        ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
     ddA += ddA_next + ddA_prev
 
     ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt, dt_in, A, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit, ddt=ddt_given)
@@ -896,6 +907,13 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
     z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
     out = ssd_selective_scan(x, dt.to(x.dtype), A, B, C, D=D.float(), z=z, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
     return rearrange(out, "b s h p -> b s (h p)")
+
+
+def _fused_ddacs():
+    """Whether the dcb kernel also works out ddA_cumsum (MAMBA_FUSED_DDACS=1, the default), from its
+    tiles' row and column sums, instead of the separate _chunk_scan_bwd_ddAcs_stable kernel forming
+    the same products again.  Equal to rounding, not bitwise: fp32 sums in another order."""
+    return os.environ.get("MAMBA_FUSED_DDACS", "1") == "1"
 
 
 def _save_conv_out():
