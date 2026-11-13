@@ -1547,19 +1547,33 @@ def _chunk_scan_bwd_dC(prev_states, dA_cumsum, dout, seq_idx=None, C=None, ngrou
 @triton.jit
 def _ddAcs_from_sums_kernel(col_ptr, row_ptr, out_ptr, n_col_tiles, n_row_tiles, chunk_size,
                             stride_tile, stride_bhc, BLOCK: tl.constexpr):
-    # One (batch, head, chunk): add up the tiles' column and row sums, and ddA_cumsum[k] is the sum
-    # of colsum - rowsum over the positions before k.
+    # One (batch, head, chunk): add up the tiles' column and row sums c and r.  ddA_cumsum[k] is
+    # sum_{j<k} (c[j] - r[j]), which equals -sum_{j>=k} (c[j] - r[j]), since the whole sum is zero.
+    # Each position takes the side with less mass behind it.  Where a sequence is padded -- its
+    # gradient exactly zero -- the stable kernel gave exact zeros, and taking the other side would
+    # leave the valid part's rounding there instead, which the norms around a padded token (rstd
+    # about 1/sqrt(eps)) amplify layer after layer until the gradient overflows.  From the near
+    # side a padded run sums only zeros, so it is exactly zero again; elsewhere the error is bounded
+    # by the smaller side's mass.
     pid = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     mask = offs < chunk_size
     col_ptr += pid * stride_bhc
     row_ptr += pid * stride_bhc
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    c = tl.zeros((BLOCK,), dtype=tl.float32)
+    r = tl.zeros((BLOCK,), dtype=tl.float32)
     for t in range(n_col_tiles):
-        acc += tl.load(col_ptr + t * stride_tile + offs, mask=mask, other=0.0)
+        c += tl.load(col_ptr + t * stride_tile + offs, mask=mask, other=0.0)
     for t in range(n_row_tiles):
-        acc -= tl.load(row_ptr + t * stride_tile + offs, mask=mask, other=0.0)
-    tl.store(out_ptr + pid * chunk_size + offs, tl.cumsum(acc, axis=0) - acc, mask=mask)
+        r += tl.load(row_ptr + t * stride_tile + offs, mask=mask, other=0.0)
+    d = c - r
+    mass = tl.abs(c) + tl.abs(r)
+    before = tl.cumsum(mass, axis=0) - mass
+    after = tl.cumsum(mass, axis=0, reverse=True)
+    forward = tl.cumsum(d, axis=0) - d
+    backward = -tl.cumsum(d, axis=0, reverse=True)
+    forward = tl.where(before == 0, 0.0, forward)
+    tl.store(out_ptr + pid * chunk_size + offs, tl.where(before <= after, forward, backward), mask=mask)
 
 
 def _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=None, CB=None, ngroups=1):
@@ -1762,7 +1776,7 @@ def _chunk_scan_bwd_ddAcs_stable_old(x, dt, dA_cumsum, dout, cb):
 
 
 def _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, cb):
-    if os.environ.get("MAMBA_DDACS_SUMS", "1") == "1":
+    if os.environ.get("MAMBA_DDACS_SUMS", "0") == "1":
         return _chunk_scan_bwd_ddAcs_sums(x, dt, dA_cumsum, dout, cb)
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
