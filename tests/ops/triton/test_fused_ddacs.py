@@ -92,5 +92,26 @@ class TheScan(unittest.TestCase):
                             self.assertTrue(torch.equal(a, b), f"{name}: {(a.float() - b.float()).abs().max().item()}")
 
 
+    def test_a_padded_tail_has_exactly_zero_ddA(self):
+        """Where a sequence is padded its gradient is exactly zero, and the stable kernel's ddA_cumsum
+        is exactly zero there.  The row and column sums must leave it so: the valid part's rounding at
+        a padded token is amplified by the norms around it (rstd about 1/sqrt(eps)) layer after layer
+        until the gradient overflows -- the NaN of the first training runs with #9."""
+        from mamba_ssm.ops.triton import ssd_bmm, ssd_chunk_scan as scan
+        for batch, seqlen, chunk, valid in ((4, 200, 224, 150), (3, 300, 96, 240), (2, 160, 160, 97)):
+            v = self._inputs(batch, seqlen, torch.bfloat16)
+            _, _, dt, dA_cumsum, *_ = ssd_combined._mamba_chunk_scan_combined_fwd(
+                v["x"], v["dt"], v["A"], v["B"], v["C"], chunk, D=v["D"], dt_bias=v["dt_bias"], dt_softplus=True)
+            dout = v["dout"].clone();dout[:, valid:] = 0
+            CB = ssd_bmm._bmm_chunk_fwd(v["C"], v["B"], chunk, output_dtype=torch.float32)
+            _, fused = scan._chunk_scan_bwd_dcb(v["x"], dt, dA_cumsum, dout, CB=CB, ngroups=v["B"].shape[2])
+            with patch.dict(os.environ, {"MAMBA_DDACS_SUMS": "0"}):
+                stable = scan._chunk_scan_bwd_ddAcs_stable(v["x"], dt, dA_cumsum, dout, CB)
+            flat = lambda t: t.reshape(batch, t.shape[1], -1)[..., :seqlen]
+            with self.subTest(shape=(batch, seqlen, chunk, valid)):
+                self.assertTrue(torch.equal(flat(stable)[..., valid + 1:], torch.zeros_like(flat(stable)[..., valid + 1:])), "the reference is zero there")
+                self.assertTrue(torch.equal(flat(fused)[..., valid + 1:], torch.zeros_like(flat(fused)[..., valid + 1:])), "and so is the fused one")
+                torch.testing.assert_close(fused, stable, rtol=1e-4, atol=1e-5 * stable.abs().max().item())
+
 if __name__ == "__main__":
     unittest.main()
